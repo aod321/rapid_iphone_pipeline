@@ -25,10 +25,14 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import struct
 import time
 from datetime import datetime
 from typing import Optional
+
+from zeroconf import ServiceInfo, ServiceBrowser, ServiceListener
+from zeroconf.asyncio import AsyncZeroconf
 
 import cv2
 import numpy as np
@@ -72,6 +76,39 @@ def decode_frame(payload: bytes):
     wall_clock = struct.unpack_from('<d', payload, 76)[0]
     jpeg_data = payload[84:84 + image_len]
     return transform, device_ts, wall_clock, jpeg_data
+
+
+# ---------------------------------------------------------------------------
+# Bonjour / mDNS helpers
+# ---------------------------------------------------------------------------
+
+def _get_local_ip() -> str:
+    """Get the local IP address (best effort)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+class iPhoneServiceListener(ServiceListener):
+    """Log iPhone app presence via mDNS."""
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        info = zc.get_service_info(type_, name)
+        if info:
+            addrs = [socket.inet_ntoa(a) for a in info.addresses]
+            print(f"[mDNS] iPhone app online: {name} at {addrs}:{info.port}")
+        else:
+            print(f"[mDNS] iPhone app online: {name}")
+
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        print(f"[mDNS] iPhone app offline: {name}")
+
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +305,36 @@ async def main_server(port: int, output_dir: str):
     print(f"TCP server listening on 0.0.0.0:{port}")
     print(f"Recordings will be saved to: {os.path.abspath(output_dir)}/")
 
-    async with server:
-        await server.serve_forever()
+    # --- Bonjour/mDNS advertising (async API to avoid EventLoopBlocked) ---
+    hostname = socket.gethostname()
+    local_ip = _get_local_ip()
+
+    service_info = ServiceInfo(
+        "_vioserver._tcp.local.",
+        f"VIO Server on {hostname}._vioserver._tcp.local.",
+        addresses=[socket.inet_aton(local_ip)],
+        port=port,
+        properties={
+            "hostname": hostname,
+            "output_dir": os.path.basename(output_dir),
+        },
+    )
+
+    aiozc = AsyncZeroconf()
+    await aiozc.async_register_service(service_info)
+    print(f"[mDNS] Advertising _vioserver._tcp on {local_ip}:{port}")
+
+    # Browse for iPhone apps (ServiceBrowser works with the underlying Zeroconf)
+    listener = iPhoneServiceListener()
+    browser = ServiceBrowser(aiozc.zeroconf, "_iphonevio._tcp.local.", listener)
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        print("[mDNS] Unregistering service...")
+        await aiozc.async_unregister_service(service_info)
+        await aiozc.async_close()
 
 
 def main():
