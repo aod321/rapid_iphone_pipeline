@@ -18,10 +18,12 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import socket
 import struct
+import subprocess
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -81,6 +83,63 @@ def decode_frame(payload: bytes):
     wall_clock = struct.unpack_from('<d', payload, 76)[0]
     jpeg_data = payload[84:84 + image_len]
     return transform, device_ts, wall_clock, jpeg_data
+
+
+def split_timestamp(ts: float) -> tuple[int, int]:
+    """Convert unix timestamp seconds to (sec, nsec)."""
+    sec = int(ts)
+    nsec = int((ts - sec) * 1e9)
+    if nsec < 0:
+        nsec = 0
+    elif nsec >= 1_000_000_000:
+        sec += 1
+        nsec -= 1_000_000_000
+    return sec, nsec
+
+
+def rotation_to_quaternion(transform) -> tuple[float, float, float, float]:
+    """3x3 rotation matrix -> (x, y, z, w) quaternion."""
+    r00, r01, r02 = float(transform[0, 0]), float(transform[0, 1]), float(transform[0, 2])
+    r10, r11, r12 = float(transform[1, 0]), float(transform[1, 1]), float(transform[1, 2])
+    r20, r21, r22 = float(transform[2, 0]), float(transform[2, 1]), float(transform[2, 2])
+
+    trace = r00 + r11 + r22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (r21 - r12) / s
+        y = (r02 - r20) / s
+        z = (r10 - r01) / s
+    elif r00 > r11 and r00 > r22:
+        s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+        w = (r21 - r12) / s
+        x = 0.25 * s
+        y = (r01 + r10) / s
+        z = (r02 + r20) / s
+    elif r11 > r22:
+        s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+        w = (r02 - r20) / s
+        x = (r01 + r10) / s
+        y = 0.25 * s
+        z = (r12 + r21) / s
+    else:
+        s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+        w = (r10 - r01) / s
+        x = (r02 + r20) / s
+        y = (r12 + r21) / s
+        z = 0.25 * s
+
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm > 1e-12:
+        inv = 1.0 / norm
+        x *= inv
+        y *= inv
+        z *= inv
+        w *= inv
+    else:
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+
+    return x, y, z, w
 
 
 # ---------------------------------------------------------------------------
@@ -390,20 +449,20 @@ class IPhoneNode:
         )
         self.logger.info(f"TCP server listening on 0.0.0.0:{self.tcp_port}")
 
-        # mDNS: advertise TCP service so iPhone can discover us
+        # mDNS: advertise TCP service via native macOS dns-sd so Apple NWBrowser can see it.
+        # Python zeroconf uses raw sockets which bypass mDNSResponder — invisible to
+        # Apple's Bonjour stack (NWBrowser, dns-sd CLI, etc.).
         local_ip = _get_local_ip()
-        tcp_service_info = ServiceInfo(
-            "_vioserver._tcp.local.",
-            f"VIO Server on {socket.gethostname()}._vioserver._tcp.local.",
-            addresses=[socket.inet_aton(local_ip)],
-            port=self.tcp_port,
-            properties={"hostname": socket.gethostname()},
+        service_name = f"VIO Server on {socket.gethostname()}"
+        dns_sd_proc = subprocess.Popen(
+            ["dns-sd", "-R", service_name, "_vioserver._tcp", "local", str(self.tcp_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        aiozc = AsyncZeroconf()
-        await aiozc.async_register_service(tcp_service_info)
         self.logger.info(f"[mDNS] Advertising _vioserver._tcp on {local_ip}:{self.tcp_port}")
 
-        # Browse for iPhone apps
+        # Browse for iPhone apps (python zeroconf is fine for browsing — we use raw sockets)
+        aiozc = AsyncZeroconf()
         listener = iPhoneServiceListener()
         browser = ServiceBrowser(aiozc.zeroconf, IPHONE_BROWSE_TYPE, listener)
 
@@ -414,8 +473,9 @@ class IPhoneNode:
             server.close()
             await server.wait_closed()
             browser.cancel()
-            await aiozc.async_unregister_service(tcp_service_info)
             await aiozc.async_close()
+            dns_sd_proc.terminate()
+            dns_sd_proc.wait(timeout=3)
             self.logger.info("TCP server and mDNS cleaned up")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -443,31 +503,51 @@ class IPhoneNode:
                         f"session={meta.get('sessionId', '?')[:8]}"
                     )
                     self.publish({
-                        "type": "iphone_meta",
+                        "type": "recording_start",
                         "ts": time.time(),
+                        "session_id": meta.get("sessionId", ""),
                         **{k: v for k, v in meta.items()},
                     })
 
                 elif msg_type == 1:
                     # Frame data
-                    transform, device_ts, wall_clock, jpeg = decode_frame(payload)
+                    transform, _device_ts, wall_clock, jpeg = decode_frame(payload)
                     self._seq += 1
                     self._last_frame_time = time.time()
+                    sec, nsec = split_timestamp(wall_clock)
+                    qx, qy, qz, qw = rotation_to_quaternion(transform)
+                    pos = transform[:3, 3]
 
                     self.publish({
-                        "type": "iphone",
-                        "seq": self._seq,
+                        "type": "image",
                         "ts": wall_clock,
-                        "device_ts": device_ts,
-                        "transform": payload[4:68],   # raw 64B transform bytes
-                        "width": self._session_metadata.get("imageWidth", 0),
-                        "height": self._session_metadata.get("imageHeight", 0),
+                        "timestamp": {"sec": sec, "nsec": nsec},
+                        "frame_id": "iphone_camera",
+                        "format": "jpeg",
                         "data": jpeg,
+                    })
+                    self.publish({
+                        "type": "iphone_pose",
+                        "ts": wall_clock,
+                        "timestamp": {"sec": sec, "nsec": nsec},
+                        "frame_id": "world",
+                        "pose": {
+                            "position": {
+                                "x": float(pos[0]),
+                                "y": float(pos[1]),
+                                "z": float(pos[2]),
+                            },
+                            "orientation": {
+                                "x": qx,
+                                "y": qy,
+                                "z": qz,
+                                "w": qw,
+                            },
+                        },
                     })
 
                     # Periodic logging
                     if self._seq % 100 == 0:
-                        pos = transform[:3, 3]
                         jpeg_kb = len(jpeg) / 1024
                         self.logger.info(
                             f"frame={self._seq:6d}  "
