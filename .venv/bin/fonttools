@@ -1,4 +1,4 @@
-#!/Users/yinzi/rapid_iphone_pipeline/.venv/bin/python
+#!/home/yinzi/rapid_iphone_pipeline/.venv/bin/python
 # -*- coding: utf-8 -*-
 import sys
 from fontTools.__main__ import main

@@ -23,10 +23,9 @@ import os
 import signal
 import socket
 import struct
-import subprocess
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import msgpack
 import uvicorn
@@ -42,6 +41,7 @@ IPHONE_TCP_PORT = 5555
 IPHONE_DATA_PORT = 5563          # ZMQ PUB port
 IPHONE_HTTP_PORT = 8004
 IPHONE_SERVICE_TYPE = "_zumi-iphone._tcp.local."
+VIO_SERVICE_TYPE = "_vioserver._tcp.local."
 IPHONE_BROWSE_TYPE = "_iphonevio._tcp.local."
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
@@ -185,9 +185,10 @@ class IPhoneNode:
     health check, recovery) so this file has zero dependency on zumi_pipeline.
     """
 
-    HEALTH_CHECK_INTERVAL = 5
-    HEALTH_CHECK_MAX_FAILURES = 3
-    AUTO_RECOVERY_ENABLED = True
+    HEALTH_CHECK_INTERVAL = 2
+    HEALTH_CHECK_MAX_FAILURES = 2
+    # Fail fast and let external supervisor (rapid_driver/systemd) restart.
+    AUTO_RECOVERY_ENABLED = False
     MAX_RECOVERY_ATTEMPTS = 10
     RECOVERY_BACKOFF_BASE = 2.0
     RECOVERY_BACKOFF_MAX = 60.0
@@ -222,7 +223,8 @@ class IPhoneNode:
 
         # --- Zeroconf ---
         self.zeroconf: Optional[AsyncZeroconf] = None
-        self.service_info: Optional[ServiceInfo] = None
+        self.http_service_info: Optional[ServiceInfo] = None
+        self.vio_service_info: Optional[ServiceInfo] = None
 
         # --- FastAPI ---
         self.app = FastAPI(title=f"{name} service (V2)")
@@ -234,6 +236,11 @@ class IPhoneNode:
         self._client_connected = False
         self._last_frame_time = 0.0
         self._session_metadata: dict = {}
+        self._heartbeat_path = os.environ.get("RAPID_HEARTBEAT_PATH", "").strip() or None
+        self._heartbeat_stop = threading.Event()
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._client_writers: Set[asyncio.StreamWriter] = set()
+        self._client_writers_lock = threading.Lock()
 
         # --- Signals ---
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -244,6 +251,8 @@ class IPhoneNode:
         if self._shutdown_triggered:
             return
         self._shutdown_triggered = True
+        self.last_error = f"signal_{signum}"
+        self._write_heartbeat()
         self.logger.info(f"Signal {signum} received, shutting down...")
         raise KeyboardInterrupt
 
@@ -282,49 +291,100 @@ class IPhoneNode:
             self._hb_thread = threading.Thread(target=self._health_check_loop, daemon=True)
             self._hb_thread.start()
 
+            # heartbeat writer thread
+            self._heartbeat_stop.clear()
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+            self._write_heartbeat()
+
         @self.app.on_event("shutdown")
         async def _shutdown():
             self.logger.info("Shutdown signal received.")
             self.is_running = False
+            self._heartbeat_stop.set()
+            self._request_client_shutdown()
             await self._unregister_zeroconf()
             if hasattr(self, "loop_thread"):
-                self.loop_thread.join(timeout=3)
+                self.loop_thread.join(timeout=5)
             if hasattr(self, "_hb_thread"):
                 self._hb_thread.join(timeout=2)
+            if hasattr(self, "_heartbeat_thread"):
+                self._heartbeat_thread.join(timeout=2)
             try:
                 self.data_pub.close(linger=0)
                 self.zmq_ctx.term()
             except Exception:
                 pass
+            self._write_heartbeat()
             self.logger.info("Shutdown complete.")
 
     # ---- Zeroconf ----
     async def _register_zeroconf(self):
         self.zeroconf = AsyncZeroconf()
         local_ip = _get_local_ip()
-        self.service_info = ServiceInfo(
+        packed_ip = socket.inet_aton(local_ip)
+
+        self.http_service_info = ServiceInfo(
             IPHONE_SERVICE_TYPE,
             f"{self.name}.{IPHONE_SERVICE_TYPE}",
             port=self.http_port,
-            addresses=[socket.inet_aton(local_ip)],
+            addresses=[packed_ip],
             properties={
                 b"data_port": str(self.data_port).encode(),
                 b"tcp_port": str(self.tcp_port).encode(),
                 b"node_name": self.name.encode(),
             },
         )
-        await self.zeroconf.async_register_service(self.service_info)
-        self.logger.info(f"Zeroconf registered: {self.name} @ {local_ip}:{self.http_port}")
+
+        vio_service_name = f"VIO Server on {socket.gethostname()}"
+        self.vio_service_info = ServiceInfo(
+            VIO_SERVICE_TYPE,
+            f"{vio_service_name}.{VIO_SERVICE_TYPE}",
+            port=self.tcp_port,
+            addresses=[packed_ip],
+            properties={
+                b"node_name": self.name.encode(),
+                b"http_port": str(self.http_port).encode(),
+                b"data_port": str(self.data_port).encode(),
+            },
+        )
+
+        try:
+            await self.zeroconf.async_register_service(self.http_service_info)
+            await self.zeroconf.async_register_service(self.vio_service_info)
+        except Exception:
+            try:
+                if self.vio_service_info:
+                    await self.zeroconf.async_unregister_service(self.vio_service_info)
+                if self.http_service_info:
+                    await self.zeroconf.async_unregister_service(self.http_service_info)
+            except Exception:
+                pass
+            await self.zeroconf.async_close()
+            self.zeroconf = None
+            self.http_service_info = None
+            self.vio_service_info = None
+            raise
+
+        self.logger.info(
+            "Zeroconf registered: "
+            f"{self.name} API={local_ip}:{self.http_port} "
+            f"TCP={local_ip}:{self.tcp_port}"
+        )
 
     async def _unregister_zeroconf(self):
-        if self.zeroconf and self.service_info:
+        if self.zeroconf:
             try:
-                await self.zeroconf.async_unregister_service(self.service_info)
+                if self.vio_service_info:
+                    await self.zeroconf.async_unregister_service(self.vio_service_info)
+                if self.http_service_info:
+                    await self.zeroconf.async_unregister_service(self.http_service_info)
                 await self.zeroconf.async_close()
             except Exception:
                 pass
         self.zeroconf = None
-        self.service_info = None
+        self.http_service_info = None
+        self.vio_service_info = None
 
     # ---- publish (msgpack over ZMQ) ----
     def publish(self, data: Dict[str, Any], topic: str = ""):
@@ -358,6 +418,44 @@ class IPhoneNode:
         }
         return payload
 
+    def _heartbeat_payload(self) -> Dict[str, Any]:
+        return {
+            "updated_at": time.time(),
+            "client_connected": self._client_connected,
+            "last_frame_at": self._last_frame_time if self._last_frame_time > 0 else None,
+            "seq": self._seq,
+            "pid": os.getpid(),
+            "error": self.last_error,
+        }
+
+    def _write_heartbeat(self) -> None:
+        if not self._heartbeat_path:
+            return
+        tmp_path = None
+        try:
+            directory = os.path.dirname(self._heartbeat_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = (
+                f"{self._heartbeat_path}.{os.getpid()}."
+                f"{threading.get_ident()}.{time.time_ns()}.tmp"
+            )
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._heartbeat_payload(), f, separators=(",", ":"))
+            os.replace(tmp_path, self._heartbeat_path)
+        except Exception as exc:
+            self.logger.warning(f"Heartbeat write failed: {exc}")
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _heartbeat_loop(self) -> None:
+        while self.is_running and not self._heartbeat_stop.is_set():
+            self._write_heartbeat()
+            self._heartbeat_stop.wait(0.5)
+
     # ---- start (blocking) ----
     def start(self):
         uvicorn.run(self.app, host="0.0.0.0", port=self.http_port, log_level="info")
@@ -371,11 +469,13 @@ class IPhoneNode:
             except Exception as exc:
                 self.last_error = str(exc)
                 self.logger.error(f"Main loop error: {exc}")
+                self._write_heartbeat()
                 if self._attempt_recovery(exc):
                     self.logger.info("Restarting main loop after recovery...")
                     continue
                 else:
                     self.logger.error("Unrecoverable error, forcing exit")
+                    self._write_heartbeat()
                     os._exit(1)
 
     # ---- health check loop ----
@@ -398,6 +498,9 @@ class IPhoneNode:
                 if self._health_check_failures >= self.HEALTH_CHECK_MAX_FAILURES:
                     self.last_error = f"Hardware health check failed: {exc}"
                     self.logger.error(self.last_error)
+                    self.logger.error("Health check threshold reached, exiting for supervisor restart")
+                    self._write_heartbeat()
+                    os._exit(1)
             time.sleep(self.HEALTH_CHECK_INTERVAL)
 
     # ---- recovery ----
@@ -424,42 +527,72 @@ class IPhoneNode:
         self._health_check_failures = 0
         self._in_recovery = False
         self.last_error = None
+        self._write_heartbeat()
         self.logger.info("Recovery successful (will restart TCP server)")
         return True
 
     # ---- iPhone-specific: hardware health ----
     def check_hardware_health(self):
+        # iPhone hot-plug is normal. "not connected" is not a fatal error.
         if not self._client_connected:
-            raise RuntimeError("No iPhone connected")
+            return
         if time.time() - self._last_frame_time > 5.0:
             raise RuntimeError("iPhone data stale")
 
     # ---- iPhone-specific: main_loop runs asyncio TCP server ----
     def main_loop(self):
         loop = asyncio.new_event_loop()
+        self._main_loop = loop
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._async_main())
         finally:
+            # Drain any remaining callbacks before closing the loop
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            self._main_loop = None
             loop.close()
+
+    def _request_client_shutdown(self):
+        loop = self._main_loop
+        if loop is None or not loop.is_running():
+            return
+
+        def _close_clients():
+            with self._client_writers_lock:
+                writers = list(self._client_writers)
+            for writer in writers:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        try:
+            loop.call_soon_threadsafe(_close_clients)
+        except RuntimeError:
+            pass
+
+    async def _close_all_clients(self):
+        with self._client_writers_lock:
+            writers = list(self._client_writers)
+        for writer in writers:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for writer in writers:
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _async_main(self):
         server = await asyncio.start_server(
             self._handle_client, "0.0.0.0", self.tcp_port
         )
         self.logger.info(f"TCP server listening on 0.0.0.0:{self.tcp_port}")
-
-        # mDNS: advertise TCP service via native macOS dns-sd so Apple NWBrowser can see it.
-        # Python zeroconf uses raw sockets which bypass mDNSResponder — invisible to
-        # Apple's Bonjour stack (NWBrowser, dns-sd CLI, etc.).
-        local_ip = _get_local_ip()
-        service_name = f"VIO Server on {socket.gethostname()}"
-        dns_sd_proc = subprocess.Popen(
-            ["dns-sd", "-R", service_name, "_vioserver._tcp", "local", str(self.tcp_port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.logger.info(f"[mDNS] Advertising _vioserver._tcp on {local_ip}:{self.tcp_port}")
 
         # Browse for iPhone apps (python zeroconf is fine for browsing — we use raw sockets)
         aiozc = AsyncZeroconf()
@@ -472,17 +605,26 @@ class IPhoneNode:
         finally:
             server.close()
             await server.wait_closed()
+            await self._close_all_clients()
             browser.cancel()
             await aiozc.async_close()
-            dns_sd_proc.terminate()
-            dns_sd_proc.wait(timeout=3)
+            current = asyncio.current_task()
+            pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             self.logger.info("TCP server and mDNS cleaned up")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
+        with self._client_writers_lock:
+            self._client_writers.add(writer)
         self.logger.info(f"Client connected: {addr}")
         self._client_connected = True
+        self.last_error = None
         self._last_frame_time = time.time()
+        self._write_heartbeat()
 
         try:
             while self.is_running:
@@ -559,14 +701,23 @@ class IPhoneNode:
 
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             self.logger.error(f"Client handler error: {exc}")
+            self.last_error = str(exc)
+            self._write_heartbeat()
         finally:
             self.logger.info(f"Client disconnected: {addr}")
             self._client_connected = False
-            writer.close()
+            self._write_heartbeat()
+            with self._client_writers_lock:
+                self._client_writers.discard(writer)
             try:
+                writer.close()
                 await writer.wait_closed()
+            except (RuntimeError, OSError):
+                pass
             except Exception:
                 pass
 
