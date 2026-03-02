@@ -10,6 +10,8 @@ Binary protocol (from iPhone app):
   Type 1 — Frame Data:
     [4B image_len uint32 LE] [64B transform float32x16 col-major]
     [8B device_timestamp float64] [8B wall_clock float64] [image_len B jpeg]
+  Type 2 — Teleop Command: JSON blob
+  Type 3 — Feasibility Data: JSON blob (per-frame feasibility metadata)
 """
 
 from __future__ import annotations
@@ -774,6 +776,18 @@ class IPhoneNode:
                         self.logger.info(f"iPhone teleop: {event.get('cmd', '?')}")
                     except Exception as exc:
                         self.logger.warning(f"Teleop decode error: {exc}")
+
+                elif msg_type == 3:
+                    # Feasibility metadata (JSON)
+                    feas = json.loads(payload.decode("utf-8"))
+                    ts = feas.get("timestamp", time.time())
+                    sec, nsec = split_timestamp(ts)
+                    self.publish({
+                        "type": "feasibility",
+                        "ts": ts,
+                        "timestamp": {"sec": sec, "nsec": nsec},
+                        **feas,
+                    })
 
                 else:
                     self.logger.warning(f"Unknown msg_type={msg_type}")
