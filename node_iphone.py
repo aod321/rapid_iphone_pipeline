@@ -31,6 +31,7 @@ import msgpack
 import uvicorn
 import zmq
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener
 from zeroconf.asyncio import AsyncZeroconf
 
@@ -38,11 +39,13 @@ from zeroconf.asyncio import AsyncZeroconf
 # Defaults
 # ---------------------------------------------------------------------------
 IPHONE_TCP_PORT = 5555
-IPHONE_DATA_PORT = 5563          # ZMQ PUB port
+IPHONE_DATA_PORT = 5563          # ZMQ PUB port (msgpack, for Recorder)
+IPHONE_TELEOP_BRIDGE_PORT = 5556 # ZMQ PUB port (JSON multipart, for teleop)
 IPHONE_HTTP_PORT = 8004
 IPHONE_SERVICE_TYPE = "_zumi-iphone._tcp.local."
 VIO_SERVICE_TYPE = "_vioserver._tcp.local."
 IPHONE_BROWSE_TYPE = "_iphonevio._tcp.local."
+IPHONE_TELEOP_SERVICE_TYPE = "_iphoneTeleop._tcp.local."
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 
@@ -199,11 +202,13 @@ class IPhoneNode:
         tcp_port: int = IPHONE_TCP_PORT,
         data_port: int = IPHONE_DATA_PORT,
         http_port: int = IPHONE_HTTP_PORT,
+        teleop_bridge_port: int = IPHONE_TELEOP_BRIDGE_PORT,
     ):
         self.name = name
         self.tcp_port = tcp_port
         self.data_port = data_port
         self.http_port = http_port
+        self.teleop_bridge_port = teleop_bridge_port
 
         self.is_running = False
         self.last_error: Optional[str] = None
@@ -214,17 +219,25 @@ class IPhoneNode:
 
         self.logger = logging.getLogger(self.name)
 
-        # --- ZMQ PUB (msgpack) ---
+        # --- ZMQ PUB (msgpack, for Recorder) ---
         self.zmq_ctx = zmq.Context()
         self.data_pub = self.zmq_ctx.socket(zmq.PUB)
         self.data_pub.setsockopt(zmq.SNDHWM, 2)
         self.data_pub.bind(f"tcp://*:{data_port}")
-        self.logger.info(f"ZMQ PUB bound to tcp://*:{data_port}")
+        self.logger.info(f"ZMQ PUB (msgpack) bound to tcp://*:{data_port}")
+
+        # --- ZMQ PUB (JSON multipart, for teleop bridge) ---
+        self.teleop_bridge_pub = self.zmq_ctx.socket(zmq.PUB)
+        self.teleop_bridge_pub.setsockopt(zmq.SNDHWM, 2)
+        self.teleop_bridge_pub.bind(f"tcp://*:{teleop_bridge_port}")
+        self._teleop_bridge_lock = threading.Lock()
+        self.logger.info(f"Teleop bridge PUB (JSON) bound to tcp://*:{teleop_bridge_port}")
 
         # --- Zeroconf ---
         self.zeroconf: Optional[AsyncZeroconf] = None
         self.http_service_info: Optional[ServiceInfo] = None
         self.vio_service_info: Optional[ServiceInfo] = None
+        self.teleop_service_info: Optional[ServiceInfo] = None
 
         # --- FastAPI ---
         self.app = FastAPI(title=f"{name} service (V2)")
@@ -258,6 +271,10 @@ class IPhoneNode:
 
     # ---- FastAPI routes ----
     def _setup_routes(self):
+        class TeleopCommand(BaseModel):
+            cmd: str
+            ts: Optional[float] = None
+
         @self.app.get("/health")
         async def health():
             try:
@@ -269,6 +286,15 @@ class IPhoneNode:
         @self.app.get("/status")
         async def status():
             return self.status_payload()
+
+        @self.app.post("/teleop")
+        async def teleop(body: TeleopCommand):
+            event = body.model_dump()
+            if event.get("ts") is None:
+                event["ts"] = time.time()
+            self.publish_teleop_bridge("teleop", event)
+            self.logger.info(f"HTTP teleop: {event['cmd']}")
+            return {"status": "ok", "cmd": event["cmd"]}
 
     # ---- FastAPI lifecycle ----
     def _setup_lifecycle(self):
@@ -311,6 +337,7 @@ class IPhoneNode:
             if hasattr(self, "_heartbeat_thread"):
                 self._heartbeat_thread.join(timeout=2)
             try:
+                self.teleop_bridge_pub.close(linger=0)
                 self.data_pub.close(linger=0)
                 self.zmq_ctx.term()
             except Exception:
@@ -349,11 +376,26 @@ class IPhoneNode:
             },
         )
 
+        teleop_service_name = f"iPhone Teleop on {socket.gethostname()}"
+        self.teleop_service_info = ServiceInfo(
+            IPHONE_TELEOP_SERVICE_TYPE,
+            f"{teleop_service_name}.{IPHONE_TELEOP_SERVICE_TYPE}",
+            port=self.teleop_bridge_port,
+            addresses=[packed_ip],
+            properties={
+                b"zmq_port": str(self.teleop_bridge_port).encode(),
+                b"node_name": self.name.encode(),
+            },
+        )
+
         try:
             await self.zeroconf.async_register_service(self.http_service_info)
             await self.zeroconf.async_register_service(self.vio_service_info)
+            await self.zeroconf.async_register_service(self.teleop_service_info)
         except Exception:
             try:
+                if self.teleop_service_info:
+                    await self.zeroconf.async_unregister_service(self.teleop_service_info)
                 if self.vio_service_info:
                     await self.zeroconf.async_unregister_service(self.vio_service_info)
                 if self.http_service_info:
@@ -364,17 +406,21 @@ class IPhoneNode:
             self.zeroconf = None
             self.http_service_info = None
             self.vio_service_info = None
+            self.teleop_service_info = None
             raise
 
         self.logger.info(
             "Zeroconf registered: "
             f"{self.name} API={local_ip}:{self.http_port} "
-            f"TCP={local_ip}:{self.tcp_port}"
+            f"TCP={local_ip}:{self.tcp_port} "
+            f"TeleopBridge={local_ip}:{self.teleop_bridge_port}"
         )
 
     async def _unregister_zeroconf(self):
         if self.zeroconf:
             try:
+                if self.teleop_service_info:
+                    await self.zeroconf.async_unregister_service(self.teleop_service_info)
                 if self.vio_service_info:
                     await self.zeroconf.async_unregister_service(self.vio_service_info)
                 if self.http_service_info:
@@ -385,6 +431,7 @@ class IPhoneNode:
         self.zeroconf = None
         self.http_service_info = None
         self.vio_service_info = None
+        self.teleop_service_info = None
 
     # ---- publish (msgpack over ZMQ) ----
     def publish(self, data: Dict[str, Any], topic: str = ""):
@@ -400,6 +447,18 @@ class IPhoneNode:
                 self.data_pub.send(payload)
         except Exception as exc:
             self.logger.warning(f"Publish failed: {exc}")
+
+    # ---- publish teleop bridge (JSON multipart over ZMQ) ----
+    def publish_teleop_bridge(self, topic: str, data: Dict[str, Any]):
+        """Publish JSON data on the teleop bridge PUB socket (thread-safe)."""
+        try:
+            with self._teleop_bridge_lock:
+                self.teleop_bridge_pub.send_multipart([
+                    topic.encode(),
+                    json.dumps(data).encode(),
+                ])
+        except Exception as exc:
+            self.logger.warning(f"Teleop bridge publish failed: {exc}")
 
     # ---- status ----
     def status_payload(self) -> Dict[str, Any]:
@@ -650,6 +709,8 @@ class IPhoneNode:
                         "session_id": meta.get("sessionId", ""),
                         **{k: v for k, v in meta.items()},
                     })
+                    # Forward to teleop bridge
+                    self.publish_teleop_bridge("meta", meta)
 
                 elif msg_type == 1:
                     # Frame data
@@ -688,6 +749,12 @@ class IPhoneNode:
                         },
                     })
 
+                    # Forward raw 4x4 transform to teleop bridge
+                    self.publish_teleop_bridge("frame", {
+                        "pose": transform.flatten().tolist(),
+                        "ts": wall_clock,
+                    })
+
                     # Periodic logging
                     if self._seq % 100 == 0:
                         jpeg_kb = len(jpeg) / 1024
@@ -696,6 +763,18 @@ class IPhoneNode:
                             f"pos=({pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:+.3f})  "
                             f"jpeg={jpeg_kb:.0f}KB"
                         )
+
+                elif msg_type == 2:
+                    # Teleop command from iPhone (JSON)
+                    try:
+                        event = json.loads(payload.decode("utf-8"))
+                        if "ts" not in event:
+                            event["ts"] = time.time()
+                        self.publish_teleop_bridge("teleop", event)
+                        self.logger.info(f"iPhone teleop: {event.get('cmd', '?')}")
+                    except Exception as exc:
+                        self.logger.warning(f"Teleop decode error: {exc}")
+
                 else:
                     self.logger.warning(f"Unknown msg_type={msg_type}")
 
@@ -732,7 +811,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--name", default="iphone_gp00", help="Node name (default: iphone_gp00)")
     parser.add_argument("--tcp-port", type=int, default=IPHONE_TCP_PORT, help="TCP listen port")
-    parser.add_argument("--data-port", type=int, default=IPHONE_DATA_PORT, help="ZMQ PUB port")
+    parser.add_argument("--data-port", type=int, default=IPHONE_DATA_PORT, help="ZMQ PUB port (msgpack, for Recorder)")
+    parser.add_argument("--teleop-bridge-port", type=int, default=IPHONE_TELEOP_BRIDGE_PORT, help="Teleop bridge ZMQ PUB port (JSON, for demo)")
     parser.add_argument("--http-port", type=int, default=IPHONE_HTTP_PORT, help="HTTP API port")
     args = parser.parse_args()
 
@@ -741,5 +821,6 @@ if __name__ == "__main__":
         tcp_port=args.tcp_port,
         data_port=args.data_port,
         http_port=args.http_port,
+        teleop_bridge_port=args.teleop_bridge_port,
     )
     node.start()
