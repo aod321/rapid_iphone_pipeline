@@ -217,7 +217,7 @@ class IPhoneNode:
         # --- ZMQ PUB (msgpack) ---
         self.zmq_ctx = zmq.Context()
         self.data_pub = self.zmq_ctx.socket(zmq.PUB)
-        self.data_pub.setsockopt(zmq.SNDHWM, 100)
+        self.data_pub.setsockopt(zmq.SNDHWM, 2)
         self.data_pub.bind(f"tcp://*:{data_port}")
         self.logger.info(f"ZMQ PUB bound to tcp://*:{data_port}")
 
